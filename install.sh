@@ -52,12 +52,26 @@ if command -v systemctl >/dev/null && systemctl --user show-environment >/dev/nu
   systemctl --user enable --now openzoo-lecore.service
   systemctl --user enable --now openzoo-ingest.timer
   echo "==> daemon + 10-minute timer enabled (systemctl --user status openzoo-ingest.timer)"
-  # First bind now, so status is real before the timer's first tick.
-  for _ in $(seq 1 30); do
-    curl -s -m 1 -o /dev/null http://127.0.0.1:8787/ && break
-    sleep 1
+  # First bind now, so status is real before the timer's first tick. The first
+  # daemon start bootstraps a venv, numpy and a shallow leCore clone, which can
+  # take a few minutes on a fresh box — wait for it rather than racing it.
+  printf "==> waiting for the leCore daemon on 127.0.0.1:8787 "
+  up=0
+  for _ in $(seq 1 240); do
+    if curl -s -m 1 -o /dev/null http://127.0.0.1:8787/; then up=1; break; fi
+    if ! systemctl --user is-active --quiet openzoo-lecore.service; then
+      echo; echo "!!! openzoo-lecore.service is not running:"
+      journalctl --user -u openzoo-lecore -n 20 --no-pager 2>/dev/null | sed 's/^/    /'
+      break
+    fi
+    printf "."; sleep 1
   done
-  systemctl --user start openzoo-ingest.service || true
+  echo
+  if [ "$up" = 1 ]; then
+    systemctl --user start openzoo-ingest.service || true
+  else
+    echo "    daemon not up yet; the timer retries every 10 minutes, or run: openzoo-ingest run"
+  fi
 else
   echo "==> no systemd --user: start the daemon with $SRC/daemon/run.sh and run openzoo-ingest on a cron"
 fi

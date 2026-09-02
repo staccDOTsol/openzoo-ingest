@@ -699,6 +699,12 @@ def main(argv):
     if cmd == "watch":
         watch()
         return 0
+    # The daemon's first start bootstraps its venv and engine; a timer tick can
+    # land mid-bootstrap. Wait for it for a while before calling it a failure.
+    for _ in range(30):
+        if daemon_up():
+            break
+        time.sleep(2)
     if not daemon_up():
         _run["errors"].append(f"leCore daemon unreachable at {LECORE}")
         log(f"leCore daemon unreachable at {LECORE} — nothing bound")
