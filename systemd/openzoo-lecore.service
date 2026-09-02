@@ -1,0 +1,12 @@
+[Unit]
+Description=openzoo leCore memory daemon (loopback only)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/share/openzoo-ingest/src/daemon/run.sh
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

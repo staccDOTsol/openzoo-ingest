@@ -1,0 +1,741 @@
+#!/usr/bin/env python3
+"""openzoo-ingest — bind what your machine produces into your own leCore memory.
+
+LOCAL BY DEFAULT. Every route reads something the desktop already writes —
+clipboard history, notification history, screenshots, coding-agent
+transcripts, shell history, tmux scrollback, files, URLs — turns it into text,
+and POSTs it to the leCore daemon on loopback. Nothing leaves the machine.
+
+The ONLY egress is a shared brain you configure on purpose: set
+OPENZOO_BRAIN_URL (and its auth) and every bound item is ALSO sent there, so a
+team or an organisation can recall across machines. Unset, that code path is
+never taken. Screenshot descriptions are the one other network call, and they
+go to the local openzoo proxy you already run — capped per run, OCR first.
+
+One context per source, appended to forever; a byte-offset ledger makes agent
+transcripts incremental (only the new tail binds each run) and a content-hash
+ledger makes everything else idempotent. `recall` fans a query across every
+source context. Every run writes status.json and, on a desktop, posts a
+notification, so you can SEE it working.
+
+  openzoo-ingest run [source ...]     default: clipboard notifications screenshots agents history
+  openzoo-ingest file PATH ...        bind text-ish files (pdf via pdftotext when present)
+  openzoo-ingest url URL              fetch, strip to text, bind
+  openzoo-ingest tmux                 bind the current pane's scrollback
+  openzoo-ingest recall QUERY [-k N]  fan-out recall, daemon-shaped JSON on stdout
+  openzoo-ingest status               contexts, counts, last run (JSON)
+  openzoo-ingest watch                live one-line bar: items, chars, per-source, last run
+
+Env (all optional):
+  OPENZOO_LECORE           http://127.0.0.1:8787     local daemon
+  OPENZOO_LECORE_TOKEN     hrr-lab-token             its bearer
+  OPENZOO_TENANT           local                     namespace inside the daemon
+  OPENZOO_PROXY            http://localhost:8402     local x402 proxy (screenshot descriptions)
+  OPENZOO_VISION_MODEL     google/gemini-2.5-flash
+  OPENZOO_VISION_CAP       10                        paid vision calls per run
+  OPENZOO_NOTIFY           1                         desktop notification per run (0 to silence)
+  OPENZOO_BRAIN_URL        (unset)                   SHARED BRAIN — the only egress. e.g. https://api.openzoo.fun
+  OPENZOO_BRAIN_KEY        (unset)                   bearer for it
+  OPENZOO_BRAIN_HEADERS    (unset)                   JSON of extra headers (e.g. wallet namespace)
+  OPENZOO_INGEST_STATE     $XDG_STATE_HOME/openzoo-ingest
+"""
+import base64
+import glob
+import hashlib
+import html
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+HOME = Path.home()
+STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local" / "state")
+OMARCHY_STATE = STATE_HOME / "omarchy"
+STATE = Path(os.environ.get("OPENZOO_INGEST_STATE") or STATE_HOME / "openzoo-ingest")
+LECORE = os.environ.get("OPENZOO_LECORE", "http://127.0.0.1:8787").rstrip("/")
+TOKEN = os.environ.get("OPENZOO_LECORE_TOKEN", "hrr-lab-token")
+TENANT = os.environ.get("OPENZOO_TENANT", "local")
+PROXY = os.environ.get("OPENZOO_PROXY", "http://localhost:8402").rstrip("/")
+VISION_MODEL = os.environ.get("OPENZOO_VISION_MODEL", "google/gemini-2.5-flash")
+VISION_CAP = int(os.environ.get("OPENZOO_VISION_CAP", "10"))
+NOTIFY = os.environ.get("OPENZOO_NOTIFY", "1") != "0"
+BRAIN_URL = (os.environ.get("OPENZOO_BRAIN_URL") or "").rstrip("/")
+BRAIN_KEY = os.environ.get("OPENZOO_BRAIN_KEY") or ""
+CHUNK = {"chunk": True, "chunk_max_chars": 700, "chunk_overlap": 80}
+MIN_CHARS = 40          # below this a slice recalls nothing useful
+TOOL_CAP = 4000         # a 2MB tool dump teaches less than its first 4k
+REQUEST_CAP = 400_000   # keep one bind request comfortably under the daemon's body limit
+
+STATE.mkdir(parents=True, exist_ok=True)
+CONTEXTS = STATE / "contexts.json"
+SEEN = STATE / "seen.txt"
+OFFSETS = STATE / "offsets.json"
+LOG = STATE / "ingest.log"
+BOUND = STATE / "bound.jsonl"
+STATUS = STATE / "status.json"
+
+_run = {"started": time.time(), "bound": 0, "chars": 0, "per_source": {}, "errors": []}
+
+
+# ---------------------------------------------------------------- daemon ---
+
+def post(url, body, headers, timeout):
+    req = urllib.request.Request(url, data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json", **headers})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
+
+def call(path, body, timeout=60):
+    return post(LECORE + path, body, {"Authorization": f"Bearer {TOKEN}"}, timeout)
+
+
+def daemon_up():
+    try:
+        call("/internal/v1/hrr/recall", {"tenant_id": TENANT, "context_id": "ctx_ping", "query": "x"}, timeout=2)
+        return True
+    except urllib.error.HTTPError:
+        return True  # a 4xx is still a daemon answering
+    except Exception:
+        return False
+
+
+def load_json(p, default):
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return default
+
+
+def contexts():
+    return load_json(CONTEXTS, {})
+
+
+def remember_context(source, ctx, where="local"):
+    c = contexts()
+    if where == "local":
+        c[source] = ctx
+    else:
+        c.setdefault("_brain", {})[source] = ctx
+    CONTEXTS.write_text(json.dumps(c, indent=2) + "\n")
+
+
+def seen():
+    try:
+        return set(SEEN.read_text().split())
+    except OSError:
+        return set()
+
+
+def mark_seen(h):
+    with SEEN.open("a") as f:
+        f.write(h + "\n")
+
+
+def h(text):
+    return hashlib.sha256(text.encode(errors="ignore")).hexdigest()[:24]
+
+
+def log(msg):
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}"
+    with LOG.open("a") as f:
+        f.write(line + "\n")
+    if os.environ.get("OPENZOO_INGEST_VERBOSE") or sys.stdout.isatty():
+        print(line)
+
+
+def brain_bind(source, batch):
+    """The one egress. Only reached when OPENZOO_BRAIN_URL is set. Sends the same
+    text the local daemon got, as the hosted API's {corpus, context_id} shape."""
+    if not BRAIN_URL:
+        return
+    headers = {}
+    if BRAIN_KEY:
+        headers["Authorization"] = f"Bearer {BRAIN_KEY}"
+    try:
+        headers.update(json.loads(os.environ.get("OPENZOO_BRAIN_HEADERS") or "{}"))
+    except Exception:
+        pass
+    ctx = contexts().get("_brain", {}).get(source)
+    corpus = "\n\n".join(i["text"] for i in batch)
+    body = {"corpus": corpus}
+    if ctx:
+        body["context_id"] = ctx
+    try:
+        r = post(BRAIN_URL + "/v1/hrr/bind", body, headers, 180)
+        got = r.get("context_id")
+        if got and got != ctx:
+            remember_context(source, got, "brain")
+        log(f"brain: {source} +{len(corpus):,} chars -> {got}")
+    except Exception as e:
+        _run["errors"].append(f"brain {source}: {str(e)[:100]}")
+        log(f"brain bind failed for {source}: {str(e)[:120]}")
+
+
+def bind(source, items):
+    """Bind [{text, metadata}] into `source`'s local context (created on first
+    use), mirroring to the shared brain if one is configured. Returns items bound."""
+    items = [i for i in items if len(i["text"].strip()) >= MIN_CHARS]
+    if not items:
+        return 0
+    bound = 0
+    ctx = contexts().get(source)
+    batch, size = [], 0
+
+    def flush():
+        nonlocal ctx, bound, batch, size
+        if not batch:
+            return
+        body = {"tenant_id": TENANT, "items": [{"text": i["text"], "metadata": i.get("metadata", {})} for i in batch], **CHUNK}
+        if ctx:
+            body["context_id"] = ctx
+        r = call("/internal/v1/hrr/bind", body, timeout=180)
+        got = r.get("context_id")
+        if not got:
+            raise RuntimeError(f"bind returned no context_id: {r}")
+        if got != ctx:
+            ctx = got
+            remember_context(source, ctx)
+        bound += len(batch)
+        chars = sum(len(i["text"]) for i in batch)
+        _run["bound"] += len(batch)
+        _run["chars"] += chars
+        ps = _run["per_source"].setdefault(source, {"items": 0, "chars": 0})
+        ps["items"] += len(batch)
+        ps["chars"] += chars
+        with BOUND.open("a") as f:
+            for it in batch:
+                f.write(json.dumps({"ts": time.time(), "source": source, "ctx": ctx, "chars": len(it["text"]),
+                                    "path": it.get("metadata", {}).get("path")}) + "\n")
+        brain_bind(source, batch)
+        batch, size = [], 0
+
+    for it in items:
+        it["text"] = it["text"][:REQUEST_CAP]
+        if size + len(it["text"]) > REQUEST_CAP and batch:
+            flush()
+        batch.append(it)
+        size += len(it["text"])
+    flush()
+    return bound
+
+
+# ---------------------------------------------------------------- sources ---
+
+def _bind_marking(source, items):
+    keys = [i.pop("_k", None) for i in items]
+    n = bind(source, items)
+    for k in keys:
+        if k:
+            mark_seen(k)
+    return n
+
+
+def src_clipboard():
+    """Omarchy's clipboard manager keeps ~/.local/state/omarchy/clipboard-history.json:
+    {type:"text", text, capturedAt} and {type:"image", path}."""
+    hist = load_json(OMARCHY_STATE / "clipboard-history.json", [])
+    done = seen()
+    items, images = [], []
+    for e in hist if isinstance(hist, list) else []:
+        if not isinstance(e, dict):
+            continue
+        if e.get("type") == "text" and isinstance(e.get("text"), str):
+            t = e["text"].strip()
+            k = "clip:" + h(t)
+            if len(t) < MIN_CHARS or k in done:
+                continue
+            items.append({"text": t, "metadata": {"source": "clipboard", "ts": e.get("capturedAt", "")}, "_k": k})
+        elif e.get("type") == "image" and e.get("path"):
+            images.append(e["path"])
+    return _bind_marking("clipboard", items) + _describe_images("clipboard", images, done)
+
+
+def src_notifications():
+    """Each expired/dismissed toast is one JSON file under
+    ~/.local/state/omarchy/notifications/history/."""
+    d = OMARCHY_STATE / "notifications" / "history"
+    done = seen()
+    items = []
+    for p in sorted(d.glob("*.json")) if d.is_dir() else []:
+        e = load_json(p, None)
+        if not isinstance(e, dict):
+            continue
+        app = e.get("appName") or e.get("app") or ""
+        summary = e.get("summary") or e.get("title") or ""
+        body = e.get("body") or ""
+        t = f"[notification{(' from ' + app) if app else ''}] {summary}\n{body}".strip()
+        k = "notif:" + h(t)
+        if k in done:
+            continue
+        items.append({"text": t, "metadata": {"source": "notifications", "app": app, "path": str(p)}, "_k": k})
+    return _bind_marking("notifications", items)
+
+
+def screenshot_dir():
+    d = os.environ.get("OMARCHY_SCREENSHOT_DIR") or os.environ.get("XDG_PICTURES_DIR")
+    if not d:
+        try:  # Omarchy sources ~/.config/user-dirs.dirs; do the same.
+            for line in (HOME / ".config" / "user-dirs.dirs").read_text().splitlines():
+                if line.startswith("XDG_PICTURES_DIR="):
+                    d = line.split("=", 1)[1].strip().strip('"').replace("$HOME", str(HOME))
+        except OSError:
+            pass
+    return Path(d or HOME / "Pictures")
+
+
+def src_screenshots():
+    files = sorted(glob.glob(str(screenshot_dir() / "screenshot-*.png")), key=os.path.getmtime)
+    return _describe_images("screenshots", files, seen())
+
+
+def describe_image(path):
+    """OCR first when tesseract is installed (free, and for a screenshot of text
+    the better transcript). Then a vision model on the LOCAL proxy — the user's
+    own paid call, which is why callers cap it."""
+    text = ""
+    if shutil.which("tesseract"):
+        r = subprocess.run(["tesseract", path, "-", "--psm", "3"], capture_output=True, text=True)
+        if r.returncode == 0 and len(r.stdout.strip()) >= MIN_CHARS:
+            text = "[ocr]\n" + r.stdout.strip()
+    try:
+        raw = Path(path).read_bytes()
+    except OSError:
+        return text
+    if len(raw) > 6_000_000 or VISION_CAP <= 0:
+        return text
+    mime = "image/png" if path.lower().endswith(".png") else "image/jpeg"
+    body = {"model": VISION_MODEL, "max_tokens": 600, "messages": [{"role": "user", "content": [
+        {"type": "text", "text": "Describe this screenshot for a searchable memory: what app, what is on screen, "
+                                 "any names, numbers, code, errors or URLs, verbatim where short."},
+        {"type": "image_url", "image_url": {"url": f"data:{mime};base64," + base64.b64encode(raw).decode()}}]}]}
+    try:
+        d = post(PROXY + "/v1/chat/completions", body, {"Authorization": "Bearer sk-openzoo"}, 120)
+        desc = (d.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+        if desc.strip():
+            text = (text + "\n\n" if text else "") + "[vision]\n" + desc.strip()
+    except Exception as e:
+        _run["errors"].append(f"vision: {str(e)[:80]}")
+        log(f"vision failed for {path}: {str(e)[:120]}")
+    return text
+
+
+def _describe_images(source, paths, done):
+    items, used = [], 0
+    for p in paths:
+        if not os.path.exists(p):
+            continue
+        k = "img:" + h(p + str(os.path.getmtime(p)))
+        if k in done:
+            continue
+        if used >= VISION_CAP:
+            log(f"{source}: vision cap {VISION_CAP} reached, rest next run")
+            break
+        used += 1
+        t = describe_image(p)
+        if not t:
+            continue  # not marked seen: retried next run
+        stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(p)))
+        items.append({"text": f"[screenshot {stamp}] {os.path.basename(p)}\n{t}",
+                      "metadata": {"source": source, "path": p, "ts": stamp}, "_k": k})
+    return _bind_marking(source, items)
+
+
+# ---- agent transcripts: incremental by byte offset ----
+
+_INSTRUCTION_MARKERS = ("<system-reminder>", "claudemd", "important: these instructions")
+
+
+def looks_like_instructions(t):
+    low = t.lower()
+    if any(m in low for m in _INSTRUCTION_MARKERS):
+        return True
+    return sum(low.count(p) for p in ("you must ", "you should ", "do not ", "never ", "always ")) >= 4
+
+
+def strings_of(obj, out, depth=0):
+    """Generic: pull the prose a transcript line carries, whatever its schema
+    (Claude, Codex rollout, pi/omp and opencode all put it under
+    text/content/input/output/summary keys)."""
+    if depth > 6:
+        return
+    if isinstance(obj, str):
+        out.append(obj)
+    elif isinstance(obj, dict):
+        role = obj.get("role") or obj.get("type")
+        for k in ("text", "content", "input", "output", "summary", "arguments", "message", "parts"):
+            if k in obj:
+                sub = []
+                strings_of(obj[k], sub, depth + 1)
+                if sub and k in ("input", "arguments"):
+                    sub = [s[:600] for s in sub]
+                if sub and k == "output":
+                    sub = [s[:TOOL_CAP] for s in sub]
+                if sub:
+                    out.append((f"[{role}] " if role and isinstance(obj.get(k), str) else "") + "\n".join(sub))
+    elif isinstance(obj, list):
+        for x in obj:
+            strings_of(x, out, depth + 1)
+
+
+def transcript_delta(path, offsets):
+    """Text from `path` beyond the last bound offset; advances the ledger."""
+    start = int(offsets.get(path, 0))
+    try:
+        size = os.path.getsize(path)
+        if size <= start:
+            return ""
+        with open(path, "rb") as f:
+            f.seek(start)
+            raw = f.read()
+    except OSError:
+        return ""
+    if not raw.endswith(b"\n"):  # a half-written last line binds next run
+        raw = raw[: raw.rfind(b"\n") + 1] if b"\n" in raw else b""
+    blocks = []
+    for line in raw.decode(errors="ignore").splitlines():
+        try:
+            e = json.loads(line)
+        except Exception:
+            continue
+        parts = []
+        strings_of(e, parts)
+        block = "\n".join(p for p in parts if p.strip())
+        if block and not looks_like_instructions(block):
+            blocks.append(block[:TOOL_CAP * 4])
+    offsets[path] = start + len(raw)
+    return "\n\n".join(blocks)
+
+
+def agent_transcripts():
+    yield from ((p, "claude") for p in glob.glob(str(HOME / ".claude" / "projects" / "*" / "*.jsonl")))
+    yield from ((p, "codex") for p in glob.glob(str(HOME / ".codex" / "sessions" / "**" / "*.jsonl"), recursive=True))
+    for a in ("pi", "omp"):
+        yield from ((p, a) for p in glob.glob(str(HOME / f".{a}" / "agent" / "sessions" / "**" / "*.jsonl"), recursive=True))
+
+
+def src_agents():
+    offsets = load_json(OFFSETS, {})
+    items = []
+    for path, agent in agent_transcripts():
+        t = transcript_delta(path, offsets)
+        if t:
+            proj = Path(path).parent.name
+            items.append({"text": f"[{agent} session {proj}/{Path(path).stem[:8]}]\n{t}",
+                          "metadata": {"source": "agents", "agent": agent, "path": path}})
+    OFFSETS.write_text(json.dumps(offsets) + "\n")
+    return bind("agents", items) + _opencode(offsets)
+
+
+def _opencode(offsets):
+    db = Path(os.environ.get("XDG_DATA_HOME") or HOME / ".local" / "share") / "opencode" / "opencode.db"
+    if not db.exists():
+        return 0
+    key, last = "opencode:rowid", 0
+    last = int(offsets.get(key, 0))
+    try:
+        conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+        tables = [r[0] for r in conn.execute("select name from sqlite_master where type='table'")]
+        table = next((t for t in ("part", "message", "messages") if t in tables), None)
+        if not table:
+            return 0
+        cols = [d[0] for d in conn.execute(f"select * from {table} limit 0").description]
+        rows = conn.execute(f"select rowid, * from {table} where rowid > ? order by rowid limit 5000", (last,)).fetchall()
+    except sqlite3.Error:
+        return 0
+    items = []
+    for r in rows:
+        last = r[0]
+        parts = []
+        for v in dict(zip(cols, r[1:])).values():
+            if isinstance(v, str) and v.startswith("{"):
+                try:
+                    strings_of(json.loads(v), parts)
+                    continue
+                except Exception:
+                    pass
+            if isinstance(v, str) and len(v) >= MIN_CHARS:
+                parts.append(v)
+        t = "\n".join(parts)
+        if t.strip():
+            items.append({"text": "[opencode]\n" + t, "metadata": {"source": "agents", "agent": "opencode"}})
+    if rows:
+        offsets[key] = last
+        OFFSETS.write_text(json.dumps(offsets) + "\n")
+    return bind("agents", items)
+
+
+def src_history():
+    offsets = load_json(OFFSETS, {})
+    items = []
+    for name in (".zsh_history", ".bash_history", ".local/share/fish/fish_history"):
+        p = HOME / name
+        if not p.exists():
+            continue
+        start = int(offsets.get(str(p), 0))
+        try:
+            with open(p, "rb") as f:
+                f.seek(start)
+                raw = f.read()
+        except OSError:
+            continue
+        if not raw:
+            continue
+        lines = []
+        for ln in raw.decode(errors="ignore").splitlines():
+            ln = re.sub(r"^: \d+:\d+;", "", ln).strip()  # zsh extended format
+            ln = re.sub(r"^- cmd: ", "", ln)              # fish
+            if ln and not ln.startswith("  when:"):
+                lines.append(ln)
+        offsets[str(p)] = start + len(raw)
+        if lines:
+            items.append({"text": f"[shell history {name}]\n" + "\n".join(lines),
+                          "metadata": {"source": "history", "path": str(p)}})
+    OFFSETS.write_text(json.dumps(offsets) + "\n")
+    return bind("history", items)
+
+
+def src_tmux():
+    if not shutil.which("tmux"):
+        return 0
+    r = subprocess.run(["tmux", "capture-pane", "-p", "-S", "-5000"], capture_output=True, text=True)
+    if r.returncode != 0 or not r.stdout.strip():
+        return 0
+    t = r.stdout.rstrip()
+    k = "tmux:" + h(t)
+    if k in seen():
+        return 0
+    n = bind("terminal", [{"text": f"[tmux pane {time.strftime('%Y-%m-%d %H:%M')}]\n{t}", "metadata": {"source": "terminal"}}])
+    mark_seen(k)
+    return n
+
+
+def file_text(p):
+    p = Path(p)
+    if p.suffix.lower() == ".pdf":
+        if not shutil.which("pdftotext"):
+            return ""
+        r = subprocess.run(["pdftotext", "-layout", str(p), "-"], capture_output=True, text=True)
+        return r.stdout if r.returncode == 0 else ""
+    try:
+        raw = p.read_bytes()
+    except OSError:
+        return ""
+    if b"\x00" in raw[:4096]:
+        return ""  # binary
+    return raw.decode(errors="ignore")
+
+
+def src_files(paths):
+    done = seen()
+    items = []
+    for arg in paths:
+        targets = [Path(arg)]
+        if Path(arg).is_dir():
+            targets = [q for q in Path(arg).rglob("*")
+                       if q.is_file() and ".git" not in q.parts and q.stat().st_size < 4_000_000]
+        for q in targets:
+            t = file_text(q)
+            if len(t.strip()) < MIN_CHARS:
+                continue
+            k = "file:" + h(str(q) + str(q.stat().st_mtime))
+            if k in done:
+                continue
+            items.append({"text": f"[file {q}]\n{t}", "metadata": {"source": "files", "path": str(q)}, "_k": k})
+    return _bind_marking("files", items)
+
+
+def src_url(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "openzoo-ingest/1.0"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        raw = r.read(6_000_000).decode(errors="ignore")
+    text = re.sub(r"(?is)<(script|style|noscript).*?</\1>", " ", raw)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    text = html.unescape(re.sub(r"[ \t]+", " ", text))
+    text = re.sub(r"\n\s*\n+", "\n\n", text).strip()
+    k = "url:" + h(url + text[:2000])
+    if k in seen():
+        return 0
+    n = bind("web", [{"text": f"[web {url}]\n{text}", "metadata": {"source": "web", "url": url}}])
+    mark_seen(k)
+    return n
+
+
+SOURCES = {
+    "clipboard": src_clipboard,
+    "notifications": src_notifications,
+    "screenshots": src_screenshots,
+    "agents": src_agents,
+    "history": src_history,
+    "tmux": src_tmux,
+}
+DEFAULT_RUN = ["clipboard", "notifications", "screenshots", "agents", "history"]
+
+
+# ---------------------------------------------------------------- recall ---
+
+def recall(query, top_k=8):
+    """Query every local source context, merge by score. Daemon-shaped output so
+    a widget can consume it without knowing which context answered."""
+    merged = []
+    local = {k: v for k, v in contexts().items() if not k.startswith("_")}
+    for source, ctx in local.items():
+        try:
+            r = call("/internal/v1/hrr/recall", {"tenant_id": TENANT, "context_id": ctx, "query": query, "top_k": top_k}, timeout=15)
+        except Exception:
+            continue
+        for it in r.get("items", []):
+            it.setdefault("metadata", {})["source"] = it["metadata"].get("source") or source
+            it["context_id"] = ctx
+            merged.append(it)
+    merged.sort(key=lambda i: -float(i.get("score", 0)))
+    return {"object": "hrr.recall", "items": merged[:top_k], "contexts": len(local)}
+
+
+# ---------------------------------------------------------------- status ---
+
+def totals():
+    per, items, chars = {}, 0, 0
+    try:
+        for ln in BOUND.read_text().splitlines():
+            e = json.loads(ln)
+            s = e.get("source", "?")
+            p = per.setdefault(s, {"items": 0, "chars": 0})
+            p["items"] += 1
+            p["chars"] += int(e.get("chars", 0))
+            items += 1
+            chars += int(e.get("chars", 0))
+    except OSError:
+        pass
+    return per, items, chars
+
+
+def write_status(ok):
+    per, items, chars = totals()
+    st = {
+        "ok": ok, "at": time.time(), "at_human": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "run": {"bound": _run["bound"], "chars": _run["chars"], "per_source": _run["per_source"],
+                "seconds": round(time.time() - _run["started"], 1), "errors": _run["errors"]},
+        "total": {"items": items, "chars": chars, "per_source": per},
+        "contexts": {k: v for k, v in contexts().items() if not k.startswith("_")},
+        "brain": {"configured": bool(BRAIN_URL), "url": BRAIN_URL or None,
+                  "contexts": contexts().get("_brain", {})},
+        "daemon": LECORE, "tenant": TENANT, "state": str(STATE),
+    }
+    STATUS.write_text(json.dumps(st, indent=2) + "\n")
+    return st
+
+
+def notify(st):
+    """A desktop notification per run that bound something (or failed), so the
+    pipeline is visible without opening a terminal. Omarchy's sender first,
+    notify-send elsewhere, silence where neither exists."""
+    if not NOTIFY:
+        return
+    if st["ok"] and st["run"]["bound"] == 0 and not st["run"]["errors"]:
+        return
+    per = ", ".join(f"{k} {v['items']}" for k, v in st["run"]["per_source"].items()) or "nothing new"
+    body = f"+{st['run']['bound']} items · {st['run']['chars']:,} chars ({per})\n" \
+           f"total {st['total']['items']:,} items · {st['total']['chars']:,} chars"
+    if st["run"]["errors"]:
+        body += "\n⚠ " + "; ".join(st["run"]["errors"])[:200]
+    title = "openzoo ingest" + ("" if st["ok"] else ": failed")
+    if shutil.which("omarchy-notification-send"):
+        subprocess.run(["omarchy-notification-send", title, body, "-t", "6000"], capture_output=True)
+    elif shutil.which("notify-send"):
+        subprocess.run(["notify-send", title, body], capture_output=True)
+
+
+def bar_line(st):
+    per = " ".join(f"{k}:{v['items']}" for k, v in sorted(st.get("total", {}).get("per_source", {}).items()))
+    age = int(time.time() - st.get("at", 0))
+    ago = f"{age}s" if age < 90 else f"{age // 60}m"
+    flag = "●" if st.get("ok") else "✗"
+    brain = " ⇄brain" if st.get("brain", {}).get("configured") else " local"
+    return f"{flag} {st['total']['items']:,} items {st['total']['chars']/1e6:.1f}M chars | {per} | last run {ago} ago{brain}"
+
+
+def watch():
+    """Live one-line bar in the terminal. Ctrl-C to stop."""
+    try:
+        while True:
+            st = load_json(STATUS, None)
+            line = bar_line(st) if st else "no run yet"
+            cols = shutil.get_terminal_size((100, 20)).columns
+            sys.stdout.write("\r" + line[:cols].ljust(cols))
+            sys.stdout.flush()
+            time.sleep(2)
+    except KeyboardInterrupt:
+        print()
+
+
+# ------------------------------------------------------------------ main ---
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "recall":
+        k = 8
+        if "-k" in rest:
+            i = rest.index("-k")
+            k = int(rest[i + 1])
+            rest = rest[:i] + rest[i + 2:]
+        print(json.dumps(recall(" ".join(rest), k)))
+        return 0
+    if cmd == "status":
+        st = load_json(STATUS, None) or write_status(True)
+        st["daemon_up"] = daemon_up()
+        print(json.dumps(st, indent=2))
+        return 0
+    if cmd == "watch":
+        watch()
+        return 0
+    if not daemon_up():
+        _run["errors"].append(f"leCore daemon unreachable at {LECORE}")
+        log(f"leCore daemon unreachable at {LECORE} — nothing bound")
+        notify(write_status(False))
+        return 2
+    ok = True
+    try:
+        if cmd == "run":
+            for s in (rest or DEFAULT_RUN):
+                if s not in SOURCES:
+                    log(f"unknown source {s}; known: {', '.join(SOURCES)}")
+                    continue
+                try:
+                    n = SOURCES[s]()
+                    log(f"{s}: bound {n}")
+                except Exception as e:
+                    ok = False
+                    _run["errors"].append(f"{s}: {str(e)[:100]}")
+                    log(f"{s} failed: {e}")
+        elif cmd == "file":
+            src_files(rest)
+        elif cmd == "url":
+            src_url(rest[0])
+        elif cmd == "tmux":
+            src_tmux()
+        else:
+            print(__doc__)
+            return 1
+    except Exception as e:
+        ok = False
+        _run["errors"].append(f"{cmd}: {str(e)[:100]}")
+        log(f"{cmd} failed: {e}")
+    st = write_status(ok)
+    log(f"done: {_run['bound']} items, {_run['chars']:,} chars — total {st['total']['items']:,} items")
+    notify(st)
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

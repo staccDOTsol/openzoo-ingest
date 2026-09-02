@@ -1,0 +1,9 @@
+[Unit]
+Description=openzoo ingest: bind clipboard, notifications, screenshots, agent transcripts, shell history into local leCore
+After=openzoo-lecore.service
+Wants=openzoo-lecore.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/env python3 %h/.local/share/openzoo-ingest/src/bin/openzoo-ingest run
+EnvironmentFile=-%h/.config/openzoo-ingest/env
