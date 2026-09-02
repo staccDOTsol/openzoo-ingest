@@ -1,7 +1,8 @@
 #!/bin/bash
 # openzoo-ingest installer. Re-run to update. Linux with systemd --user.
 #
-#   curl -fsSL https://raw.githubusercontent.com/staccDOTsol/openzoo-ingest/main/install.sh | bash
+#   omarchy plugin add https://github.com/staccDOTsol/openzoo-ingest.git --enable
+#   (or, from a checkout: bash install.sh)
 #
 # Everything lands under ~/.local/share/openzoo-ingest and ~/.config/openzoo-ingest.
 # Nothing here opens a port beyond loopback and nothing here sends data off the
@@ -43,11 +44,9 @@ else
   git clone --depth 1 --quiet "$REPO" "$SRC"
 fi
 
-# Optional extractors. Omarchy already ships tesseract; poppler gives pdftotext.
-if command -v pacman >/dev/null && ! command -v pdftotext >/dev/null; then
-  echo "==> installing poppler (pdftotext) — sudo may prompt"
-  sudo pacman -S --needed --noconfirm poppler >/dev/null 2>&1 || echo "    skipped (pdf files will not bind)"
-fi
+# Optional extractor. Omarchy already ships tesseract; pdftotext (poppler) is
+# the user's call — this installer never touches a system package manager.
+command -v pdftotext >/dev/null || echo "==> pdftotext not found: PDFs will not bind (optional: install poppler)"
 
 mkdir -p "$CONF" "$UNITS" "$HOME/.local/bin"
 [ -f "$CONF/env" ] || cat >"$CONF/env" <<'EOF'

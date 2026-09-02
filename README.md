@@ -8,10 +8,11 @@ On Omarchy, as a plugin:
 omarchy plugin add https://github.com/staccDOTsol/openzoo-ingest.git --enable
 ```
 
-Anywhere else with systemd:
+Anywhere else with systemd, from a checkout you have read:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/staccDOTsol/openzoo-ingest/main/install.sh | bash
+git clone https://github.com/staccDOTsol/openzoo-ingest ~/.local/share/openzoo-ingest/src
+bash ~/.local/share/openzoo-ingest/src/install.sh
 ```
 
 Remove: `omarchy plugin remove openzoo-ingest` (or `openzoo-ingest uninstall`),
@@ -20,10 +21,12 @@ The plugin draws nothing on the bar; it only keeps the daemon and the
 ten-minute timer enabled. The [openzoo bar widget](https://github.com/staccDOTsol/omarchy-openzoo-plugin)
 is what you recall through.
 
-External dependencies: `python3` (venv + numpy for the daemon), `git`, `curl`,
-`tesseract` (ships with Omarchy; screenshot OCR), optional `poppler`
-(pdftotext). The engine, [leCore](https://github.com/staccDOTsol/leCore), is
-fetched once at a pinned commit.
+External dependencies: `python3` and `git` (the daemon builds a private venv
+and installs `numpy` into it — nothing system-wide), `curl`, `tesseract`
+(ships with Omarchy; screenshot OCR). Optional: `poppler` for pdftotext —
+install it yourself if you want PDFs bound; this plugin never runs a package
+manager. The engine, [leCore](https://github.com/staccDOTsol/leCore), is
+fetched once at a pinned commit into the plugin's own data directory.
 
 Ten minutes later, and every ten minutes after:
 
