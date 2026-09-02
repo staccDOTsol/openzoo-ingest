@@ -711,6 +711,9 @@ def main(argv):
     if cmd == "watch":
         watch()
         return 0
+    if cmd == "uninstall":
+        here = Path(__file__).resolve().parent.parent
+        return subprocess.run(["bash", str(here / "install.sh"), "--uninstall"]).returncode
     # The daemon's first start bootstraps its venv and engine; a timer tick can
     # land mid-bootstrap. Wait for it for a while before calling it a failure.
     for _ in range(30):

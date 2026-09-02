@@ -2,9 +2,28 @@
 
 Everything your machine produces, bound into your own memory. Local by default.
 
+On Omarchy, as a plugin:
+
+```bash
+omarchy plugin add https://github.com/staccDOTsol/openzoo-ingest.git --enable
+```
+
+Anywhere else with systemd:
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/staccDOTsol/openzoo-ingest/main/install.sh | bash
 ```
+
+Remove: `omarchy plugin remove openzoo-ingest` (or `openzoo-ingest uninstall`),
+then `rm -rf ~/.local/share/openzoo-ingest` if you want the memory gone too.
+The plugin draws nothing on the bar; it only keeps the daemon and the
+ten-minute timer enabled. The [openzoo bar widget](https://github.com/staccDOTsol/omarchy-openzoo-plugin)
+is what you recall through.
+
+External dependencies: `python3` (venv + numpy for the daemon), `git`, `curl`,
+`tesseract` (ships with Omarchy; screenshot OCR), optional `poppler`
+(pdftotext). The engine, [leCore](https://github.com/staccDOTsol/leCore), is
+fetched once at a pinned commit.
 
 Ten minutes later, and every ten minutes after:
 

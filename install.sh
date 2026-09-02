@@ -21,7 +21,19 @@ done
 # The checkout is ours and nobody edits it in place, so an update is "become
 # origin/main", not a merge: a stray mode bit or a hand edit must never leave
 # the box on a stale version with "unstaged changes" as the only clue.
-if [ -d "$SRC/.git" ]; then
+# PLUGIN MODE: `omarchy plugin add` already cloned this repository into
+# ~/.config/omarchy/plugins/openzoo-ingest, so the checkout IS that directory.
+# Link it into the place the units expect and skip the clone/update; the
+# plugin manager owns updates from here on.
+if [ "${1:-}" = "--plugin" ]; then
+  PLUGIN_DIR="${2:?--plugin needs the plugin directory}"
+  mkdir -p "$SHARE"
+  if [ -e "$SRC" ] && [ ! -L "$SRC" ]; then
+    mv "$SRC" "$SRC.pre-plugin.$(date +%s)"
+  fi
+  ln -sfn "$PLUGIN_DIR" "$SRC"
+  echo "==> plugin checkout linked: $SRC -> $PLUGIN_DIR"
+elif [ -d "$SRC/.git" ]; then
   echo "==> updating $SRC"
   git -C "$SRC" fetch --quiet --depth 1 origin main
   git -C "$SRC" reset --quiet --hard origin/main
@@ -53,6 +65,14 @@ mkdir -p "$CONF" "$UNITS" "$HOME/.local/bin"
 # OPENZOO_BRAIN_KEY=
 EOF
 ln -sf "$SRC/bin/openzoo-ingest" "$HOME/.local/bin/openzoo-ingest"
+
+if [ "${1:-}" = "--uninstall" ]; then
+  systemctl --user disable --now openzoo-ingest.timer openzoo-lecore.service 2>/dev/null || true
+  rm -f "$UNITS/openzoo-ingest.service" "$UNITS/openzoo-ingest.timer" "$UNITS/openzoo-lecore.service" "$HOME/.local/bin/openzoo-ingest"
+  systemctl --user daemon-reload 2>/dev/null || true
+  echo "openzoo-ingest units removed. Memory kept at $SHARE (delete it yourself if you want it gone)."
+  exit 0
+fi
 
 if command -v systemctl >/dev/null && systemctl --user show-environment >/dev/null 2>&1; then
   cp "$SRC/systemd/"*.service "$SRC/systemd/"*.timer "$UNITS/"

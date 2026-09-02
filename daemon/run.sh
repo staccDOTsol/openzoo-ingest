@@ -21,9 +21,14 @@ fi
   "$VENV/bin/pip" install --quiet --disable-pip-version-check numpy
 }
 
+# PINNED to an exact commit: the engine is code this daemon executes, so it is
+# fetched by SHA, never by branch. Bump LECORE_COMMIT deliberately.
+LECORE_COMMIT="${LECORE_COMMIT:-ea456c3f1d4b05acc6ac1ea5a9946d77759f8d72}"
 if [ ! -f "$LECORE/holographic/caching_and_storage/holographic_index.py" ]; then
-  echo "==> cloning leCore (the engine) into $LECORE"
-  git clone --depth 1 https://github.com/staccDOTsol/leCore "$LECORE"
+  echo "==> fetching leCore (the engine) at $LECORE_COMMIT into $LECORE"
+  git init -q "$LECORE"
+  git -C "$LECORE" fetch -q --depth 1 https://github.com/staccDOTsol/leCore "$LECORE_COMMIT"
+  git -C "$LECORE" checkout -q FETCH_HEAD
 fi
 
 exec env LECORE_PATH="$LECORE" HRR_DATA_DIR="$DATA" HRR_PORT="$PORT" \

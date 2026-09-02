@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "openzoo-ingest",
+  "name": "openzoo ingest",
+  "version": "0.1.0",
+  "author": "stacc",
+  "license": "MIT",
+  "repository": "https://github.com/staccDOTsol/openzoo-ingest",
+  "description": "Everything your machine produces, bound into your own local leCore memory every ten minutes: clipboard, notifications, screenshots (OCR), coding-agent transcripts, shell history. Local by default; nothing leaves unasked. Pairs with the openzoo bar widget, which recalls over it.",
+  "kinds": ["service"],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Ingest.qml"
+  }
+}
