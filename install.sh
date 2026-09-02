@@ -18,15 +18,18 @@ for c in git python3; do
   command -v "$c" >/dev/null || { echo "need $c"; exit 1; }
 done
 
+# The checkout is ours and nobody edits it in place, so an update is "become
+# origin/main", not a merge: a stray mode bit or a hand edit must never leave
+# the box on a stale version with "unstaged changes" as the only clue.
 if [ -d "$SRC/.git" ]; then
   echo "==> updating $SRC"
-  git -C "$SRC" pull --ff-only --quiet
+  git -C "$SRC" fetch --quiet --depth 1 origin main
+  git -C "$SRC" reset --quiet --hard origin/main
 else
   echo "==> cloning into $SRC"
   mkdir -p "$SHARE"
   git clone --depth 1 --quiet "$REPO" "$SRC"
 fi
-chmod +x "$SRC/bin/openzoo-ingest" "$SRC/daemon/run.sh"
 
 # Optional extractors. Omarchy already ships tesseract; poppler gives pdftotext.
 if command -v pacman >/dev/null && ! command -v pdftotext >/dev/null; then
