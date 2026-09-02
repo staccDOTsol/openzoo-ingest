@@ -40,10 +40,15 @@ fi
 mkdir -p "$CONF" "$UNITS" "$HOME/.local/bin"
 [ -f "$CONF/env" ] || cat >"$CONF/env" <<'EOF'
 # openzoo-ingest — read by the systemd unit. Everything is optional.
-# OPENZOO_VISION_CAP=10            paid screenshot descriptions per run (0 = OCR only)
+# Defaults are LOCAL ONLY: nothing below leaves the machine until you uncomment it.
+#
 # OPENZOO_NOTIFY=1                 desktop notification per run (0 to silence)
 #
-# SHARED BRAIN — the only egress. Leave unset to stay fully local.
+# EGRESS 1 — screenshot vision. Sends screenshot PIXELS through the local proxy
+# to a hosted model, N paid calls per run. 0 (default) = tesseract OCR only, local.
+# OPENZOO_VISION_CAP=10
+#
+# EGRESS 2 — shared brain. Every bound item is ALSO sent here.
 # OPENZOO_BRAIN_URL=https://api.openzoo.fun
 # OPENZOO_BRAIN_KEY=
 EOF

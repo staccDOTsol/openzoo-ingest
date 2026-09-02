@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """openzoo-ingest — bind what your machine produces into your own leCore memory.
 
-LOCAL BY DEFAULT. Every route reads something the desktop already writes —
-clipboard history, notification history, screenshots, coding-agent
-transcripts, shell history, tmux scrollback, files, URLs — turns it into text,
-and POSTs it to the leCore daemon on loopback. Nothing leaves the machine.
+WHAT STAYS LOCAL AND WHAT LEAVES — explicitly:
 
-The ONLY egress is a shared brain you configure on purpose: set
-OPENZOO_BRAIN_URL (and its auth) and every bound item is ALSO sent there, so a
-team or an organisation can recall across machines. Unset, that code path is
-never taken. Screenshot descriptions are the one other network call, and they
-go to the local openzoo proxy you already run — capped per run, OCR first.
+  LOCAL (never leaves the machine): clipboard, notifications, agent
+  transcripts, shell history, tmux scrollback, files, OCR of screenshots
+  (tesseract). All of it goes to the leCore daemon on 127.0.0.1 and stops there.
+
+  EGRESS, only when you turn it on:
+    * screenshot VISION descriptions — the image is sent through the local
+      openzoo proxy to a hosted model, i.e. the pixels leave. OFF by default
+      (OPENZOO_VISION_CAP=0 → OCR only). Set a cap to allow N paid calls/run.
+    * the SHARED BRAIN — OPENZOO_BRAIN_URL: every bound item is also sent
+      there so a team recalls across machines. Unset → that code never runs.
+    * `url URL` fetches that URL (obviously); the fetched text stays local.
 
 One context per source, appended to forever; a byte-offset ledger makes agent
 transcripts incremental (only the new tail binds each run) and a content-hash
@@ -32,9 +35,9 @@ Env (all optional):
   OPENZOO_TENANT           local                     namespace inside the daemon
   OPENZOO_PROXY            http://localhost:8402     local x402 proxy (screenshot descriptions)
   OPENZOO_VISION_MODEL     google/gemini-2.5-flash
-  OPENZOO_VISION_CAP       10                        paid vision calls per run
+  OPENZOO_VISION_CAP       0                         EGRESS: paid vision calls per run (0 = OCR only, local)
   OPENZOO_NOTIFY           1                         desktop notification per run (0 to silence)
-  OPENZOO_BRAIN_URL        (unset)                   SHARED BRAIN — the only egress. e.g. https://api.openzoo.fun
+  OPENZOO_BRAIN_URL        (unset)                   EGRESS: shared brain, e.g. https://api.openzoo.fun
   OPENZOO_BRAIN_KEY        (unset)                   bearer for it
   OPENZOO_BRAIN_HEADERS    (unset)                   JSON of extra headers (e.g. wallet namespace)
   OPENZOO_INGEST_STATE     $XDG_STATE_HOME/openzoo-ingest
@@ -64,7 +67,7 @@ TOKEN = os.environ.get("OPENZOO_LECORE_TOKEN", "hrr-lab-token")
 TENANT = os.environ.get("OPENZOO_TENANT", "local")
 PROXY = os.environ.get("OPENZOO_PROXY", "http://localhost:8402").rstrip("/")
 VISION_MODEL = os.environ.get("OPENZOO_VISION_MODEL", "google/gemini-2.5-flash")
-VISION_CAP = int(os.environ.get("OPENZOO_VISION_CAP", "10"))
+VISION_CAP = int(os.environ.get("OPENZOO_VISION_CAP", "0"))
 NOTIFY = os.environ.get("OPENZOO_NOTIFY", "1") != "0"
 BRAIN_URL = (os.environ.get("OPENZOO_BRAIN_URL") or "").rstrip("/")
 BRAIN_KEY = os.environ.get("OPENZOO_BRAIN_KEY") or ""
@@ -627,6 +630,11 @@ def write_status(ok):
         "contexts": {k: v for k, v in contexts().items() if not k.startswith("_")},
         "brain": {"configured": bool(BRAIN_URL), "url": BRAIN_URL or None,
                   "contexts": contexts().get("_brain", {})},
+        # Spelled out so a UI can say it: what, if anything, leaves the machine.
+        "egress": {"brain": bool(BRAIN_URL), "vision": VISION_CAP > 0,
+                   "summary": ("local only" if not BRAIN_URL and VISION_CAP <= 0 else
+                               ", ".join(x for x in ["shared brain" if BRAIN_URL else "",
+                                                     f"screenshot vision ({VISION_CAP}/run)" if VISION_CAP > 0 else ""] if x))},
         "daemon": LECORE, "tenant": TENANT, "state": str(STATE),
     }
     STATUS.write_text(json.dumps(st, indent=2) + "\n")
@@ -658,8 +666,8 @@ def bar_line(st):
     age = int(time.time() - st.get("at", 0))
     ago = f"{age}s" if age < 90 else f"{age // 60}m"
     flag = "●" if st.get("ok") else "✗"
-    brain = " ⇄brain" if st.get("brain", {}).get("configured") else " local"
-    return f"{flag} {st['total']['items']:,} items {st['total']['chars']/1e6:.1f}M chars | {per} | last run {ago} ago{brain}"
+    eg = st.get("egress", {}).get("summary") or ("⇄ brain" if st.get("brain", {}).get("configured") else "local only")
+    return f"{flag} {st['total']['items']:,} items {st['total']['chars']/1e6:.1f}M chars | {per} | last run {ago} ago | {eg}"
 
 
 def watch():

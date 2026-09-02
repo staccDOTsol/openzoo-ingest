@@ -9,7 +9,7 @@ curl -fsSL https://raw.githubusercontent.com/staccDOTsol/openzoo-ingest/main/ins
 Ten minutes later, and every ten minutes after:
 
 ```
-● 4,812 items 38.2M chars | agents:3901 clipboard:412 history:388 notifications:74 screenshots:37 | last run 40s ago local
+● 4,812 items 38.2M chars | agents:3901 clipboard:412 history:388 notifications:74 screenshots:37 | last run 40s ago | local only
 ```
 
 That line is `openzoo-ingest watch`. The same numbers arrive as a desktop
@@ -22,7 +22,7 @@ without opening anything.
 |---|---|---|
 | `clipboard` | Omarchy clipboard history (text, and images described) | `~/.local/state/omarchy/clipboard-history.json` |
 | `notifications` | every toast that expired or was dismissed | `~/.local/state/omarchy/notifications/history/` |
-| `screenshots` | `screenshot-*.png` in your Pictures dir | tesseract OCR (free), then a vision model on your local openzoo proxy, capped per run |
+| `screenshots` | `screenshot-*.png` in your Pictures dir | tesseract OCR (local, free); vision descriptions only if `OPENZOO_VISION_CAP` > 0 (egress) |
 | `agents` | Claude Code, Codex, pi, omp, opencode transcripts | incremental — only the new tail of each session binds |
 | `history` | zsh / bash / fish history | incremental |
 | `tmux` | the current pane's scrollback | on demand |
@@ -33,31 +33,28 @@ Each source is its own leCore context, appended forever. A content-hash ledger
 makes every run idempotent; a byte-offset ledger makes transcripts incremental.
 `openzoo-ingest recall "…"` fans a query across all of them.
 
-## Where the data goes
+## What stays local, what leaves
 
-**To a leCore daemon on 127.0.0.1:8787, and nowhere else.** The installer
-starts that daemon as a user service (`openzoo-lecore.service`); it binds to
-loopback and this package never changes that. The vendored daemon is the
-`hrr` sidecar over the [leCore](https://github.com/staccDOTsol/leCore) engine,
-cloned from git into `~/.local/share/openzoo-ingest/leCore`.
+**Local — never leaves the machine.** Clipboard, notifications, agent
+transcripts, shell history, tmux, files, and tesseract OCR of screenshots all
+go to a leCore daemon on `127.0.0.1:8787` and stop there. The installer starts
+that daemon as a user service (`openzoo-lecore.service`); it binds to loopback
+and this package never changes that. The vendored daemon is the `hrr` sidecar
+over the [leCore](https://github.com/staccDOTsol/leCore) engine, cloned from
+git into `~/.local/share/openzoo-ingest/leCore`.
 
-The one other network call: screenshot descriptions go to the local openzoo
-proxy (`localhost:8402`) you already run — your own paid call, capped at
-`OPENZOO_VISION_CAP` per run, OCR tried first. Set the cap to 0 for OCR only.
+**Egress — off until you turn it on.** Two switches, both in
+`~/.config/openzoo-ingest/env`, both unset by default:
 
-## The shared brain (the only egress)
+| switch | what leaves | default |
+|---|---|---|
+| `OPENZOO_VISION_CAP=N` | screenshot **pixels**, sent through your local openzoo proxy to a hosted vision model, up to N paid calls per run | `0` — OCR only |
+| `OPENZOO_BRAIN_URL` + `OPENZOO_BRAIN_KEY` | **every bound item**, mirrored to that endpoint so a team recalls across machines (any member's bearer; the server signs the namespace) | unset |
 
-Set these in `~/.config/openzoo-ingest/env` and every item bound locally is
-also bound to that endpoint, so a team or an organisation recalls across
-machines:
-
-```
-OPENZOO_BRAIN_URL=https://api.openzoo.fun
-OPENZOO_BRAIN_KEY=…
-```
-
-Unset, that code path is never executed. There is no default brain and no
-silent opt-in.
+`openzoo-ingest url URL` fetches that URL (naturally); the text it returns
+stays local. The `watch` bar and `status.json` state the egress posture in
+words — `local only`, `shared brain`, `screenshot vision (10/run)` — so you
+never have to guess which mode a machine is in.
 
 ## Commands
 
