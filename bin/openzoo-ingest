@@ -3,9 +3,13 @@
 
 WHAT STAYS LOCAL AND WHAT LEAVES — explicitly:
 
-  LOCAL (never leaves the machine): clipboard, notifications, agent
-  transcripts, shell history, tmux scrollback, files, OCR of screenshots
-  (tesseract). All of it goes to the leCore daemon on 127.0.0.1 and stops there.
+  LOCAL: clipboard, notifications, agent transcripts, shell history, tmux
+  scrollback, files, OCR of screenshots (tesseract). Ingest writes all of it
+  to the leCore daemon on 127.0.0.1 and sends nothing anywhere else. A bound
+  slice can leave LATER only as recalled context: when you ask a question
+  through a client that recalls first (the openzoo bar), the slices that
+  matched that question travel with it, on that one paid call. Nothing leaves
+  unasked.
 
   EGRESS, only when you turn it on:
     * screenshot VISION descriptions — the image is sent through the local

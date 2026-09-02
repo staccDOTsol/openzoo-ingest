@@ -35,9 +35,13 @@ makes every run idempotent; a byte-offset ledger makes transcripts incremental.
 
 ## What stays local, what leaves
 
-**Local — never leaves the machine.** Clipboard, notifications, agent
-transcripts, shell history, tmux, files, and tesseract OCR of screenshots all
-go to a leCore daemon on `127.0.0.1:8787` and stop there. The installer starts
+**Ingest is local.** Clipboard, notifications, agent transcripts, shell
+history, tmux, files, and tesseract OCR of screenshots all go to a leCore
+daemon on `127.0.0.1:8787`. Ingest itself sends nothing anywhere else. What
+CAN leave later is a *recalled slice*: when you ask a question through the
+openzoo bar (or any client that recalls before it asks), only the slices that
+matched that question leave, attached to that one paid call. Nothing leaves
+unasked. The installer starts
 that daemon as a user service (`openzoo-lecore.service`); it binds to loopback
 and this package never changes that. The vendored daemon is the `hrr` sidecar
 over the [leCore](https://github.com/staccDOTsol/leCore) engine, cloned from
