@@ -35,7 +35,9 @@ notification, so you can SEE it working.
 
 Env (all optional):
   OPENZOO_LECORE           http://127.0.0.1:8787     local daemon
-  OPENZOO_LECORE_TOKEN     hrr-lab-token             its bearer
+  OPENZOO_LECORE_TOKEN     (unset)                   override; otherwise the per-install
+                                                     secret in ~/.config/openzoo-ingest/service-token.
+                                                     The old public token is rejected.
   OPENZOO_TENANT           local                     namespace inside the daemon
   OPENZOO_PROXY            http://localhost:8402     local x402 proxy (screenshot descriptions)
   OPENZOO_VISION_MODEL     google/gemini-2.5-flash
@@ -62,12 +64,16 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+_DAEMON_DIR = Path(__file__).resolve().parent.parent / "daemon"
+if str(_DAEMON_DIR) not in sys.path:
+    sys.path.insert(0, str(_DAEMON_DIR))
+from service_auth import AuthError, load_service_token  # noqa: E402
+
 HOME = Path.home()
 STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local" / "state")
 OMARCHY_STATE = STATE_HOME / "omarchy"
 STATE = Path(os.environ.get("OPENZOO_INGEST_STATE") or STATE_HOME / "openzoo-ingest")
 LECORE = os.environ.get("OPENZOO_LECORE", "http://127.0.0.1:8787").rstrip("/")
-TOKEN = os.environ.get("OPENZOO_LECORE_TOKEN", "hrr-lab-token")
 TENANT = os.environ.get("OPENZOO_TENANT", "local")
 PROXY = os.environ.get("OPENZOO_PROXY", "http://localhost:8402").rstrip("/")
 VISION_MODEL = os.environ.get("OPENZOO_VISION_MODEL", "google/gemini-2.5-flash")
@@ -78,7 +84,7 @@ BRAIN_KEY = os.environ.get("OPENZOO_BRAIN_KEY") or ""
 CHUNK = {"chunk": True, "chunk_max_chars": 700, "chunk_overlap": 80}
 MIN_CHARS = 40          # below this a slice recalls nothing useful
 TOOL_CAP = 4000         # a 2MB tool dump teaches less than its first 4k
-REQUEST_CAP = 400_000   # keep one bind request comfortably under the daemon's body limit
+REQUEST_CAP = 400_000   # one bind stays under the daemon's 8 MiB body cap
 
 STATE.mkdir(parents=True, exist_ok=True)
 CONTEXTS = STATE / "contexts.json"
@@ -100,8 +106,15 @@ def post(url, body, headers, timeout):
         return json.loads(r.read().decode())
 
 
+def service_token():
+    """Per-install secret. Never the old public default. Does not create the file;
+    install.sh or the daemon's first start does, so a client cannot invent one
+    the daemon does not already have."""
+    return load_service_token(env_var="OPENZOO_LECORE_TOKEN", generate=False)
+
+
 def call(path, body, timeout=60):
-    return post(LECORE + path, body, {"Authorization": f"Bearer {TOKEN}"}, timeout)
+    return post(LECORE + path, body, {"Authorization": f"Bearer {service_token()}"}, timeout)
 
 
 def daemon_up():
@@ -721,8 +734,13 @@ def main(argv):
             break
         time.sleep(2)
     if not daemon_up():
-        _run["errors"].append(f"leCore daemon unreachable at {LECORE}")
-        log(f"leCore daemon unreachable at {LECORE} — nothing bound")
+        why = f"leCore daemon unreachable at {LECORE}"
+        try:
+            service_token()
+        except AuthError as exc:
+            why = str(exc)
+        _run["errors"].append(why)
+        log(why + " — nothing bound")
         notify(write_status(False))
         return 2
     ok = True

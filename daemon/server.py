@@ -16,6 +16,13 @@ import numpy as np
 
 # local imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from service_auth import (  # noqa: E402
+    AuthError,
+    auth_header_ok,
+    check_content_length,
+    load_service_token,
+    resolve_max_body,
+)
 from rank import (  # noqa: E402
     build_bm25,
     build_vec_index,
@@ -32,9 +39,9 @@ import semantic_stage  # noqa: E402  — imports nothing heavy; cold when SEMANT
 
 VERSION = "0.1.0-dogfood"
 DEFAULT_BUDGET = 1024
-DEFAULT_TOKEN = "hrr-lab-token"
 DEFAULT_PORT = 7090
-MAX_BODY = int(os.environ.get("HRR_MAX_BODY") or 34_359_738_368)  # 32GiB
+# 8 MiB by default, hard-capped at 32 MiB. Never the old 32 GiB allowance.
+MAX_BODY = resolve_max_body()
 # BM25 hydration caps. Above EITHER, recall stays on the bind-time vec path —
 # decompressing every text is exactly what 502'd recall at ~40M words on 19MB
 # items. Zoo chunks are ~600 chars so hydrating them is cheap; a fat legacy
@@ -203,16 +210,16 @@ class App:
         data = _env("HRR_DATA_DIR", "/workspace/hrr-context/data")
         self.store = ContextStore(data)
         self.cache = ContextCache(self.store)
-        self.token = _env("HRR_SERVICE_TOKEN", DEFAULT_TOKEN)
+        try:
+            self.token = load_service_token()
+        except AuthError as exc:
+            raise SystemExit(
+                "refusing to start without a strong per-install token: %s" % exc
+            ) from exc
 
     def auth_ok(self, headers) -> bool:
-        h = headers.get("X-HRR-Service-Token") or ""
-        if h and h == self.token:
-            return True
-        auth = headers.get("Authorization") or ""
-        if auth.startswith("Bearer ") and auth[7:] == self.token:
-            return True
-        return False
+        # Loopback is not the control: every account on the machine can reach it.
+        return auth_header_ok(self.token, headers)
 
 
 APP = App()
@@ -1024,12 +1031,16 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def _read_json(self) -> dict:
-        n = int(self.headers.get("Content-Length") or 0)
-        if n <= 0:
-            return {}
-        if n > MAX_BODY:
+        n, err = check_content_length(self.headers.get("Content-Length"), MAX_BODY)
+        if err == "bad":
+            raise StoreError("invalid_request", "Content-Length must be an integer", 400)
+        if err == "too_large":
             raise StoreError("invalid_request", "body too large", 413)
+        if n == 0:
+            return {}
         raw = self.rfile.read(n)
+        if len(raw) != n:
+            raise StoreError("invalid_request", "truncated body", 400)
         try:
             return json.loads(raw.decode("utf-8") or "{}")
         except ValueError:
@@ -1072,8 +1083,8 @@ def main():
     port = int(_env("HRR_PORT", str(DEFAULT_PORT)))
     httpd = ThreadingHTTPServer((host, port), Handler)
     print(
-        "HRR Context dogfood listening on http://%s:%d  token=%s  data=%s"
-        % (host, port, APP.token, APP.store.root),
+        "HRR Context dogfood listening on http://%s:%d  auth=per-install-token  data=%s"
+        % (host, port, APP.store.root),
         flush=True,
     )
     httpd.serve_forever()

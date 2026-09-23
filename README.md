@@ -21,8 +21,8 @@ The plugin draws nothing on the bar; it only keeps the daemon and the
 ten-minute timer enabled. The [openzoo bar widget](https://github.com/staccDOTsol/omarchy-openzoo-plugin)
 is what you recall through.
 
-External dependencies: `python3` and `git` (the daemon builds a private venv
-and installs `numpy` into it — nothing system-wide), `curl`, `tesseract`
+External dependencies: `python3` (>= 3.12) and `git` (the daemon builds a private venv
+and installs pinned `numpy` into it — nothing system-wide), `curl`, `tesseract`
 (ships with Omarchy; screenshot OCR). Optional: `poppler` for pdftotext —
 install it yourself if you want PDFs bound; this plugin never runs a package
 manager. The engine, [leCore](https://github.com/staccDOTsol/leCore), is
@@ -65,9 +65,24 @@ openzoo bar (or any client that recalls before it asks), only the slices that
 matched that question leave, attached to that one paid call. Nothing leaves
 unasked. The installer starts
 that daemon as a user service (`openzoo-lecore.service`); it binds to loopback
-and this package never changes that. The vendored daemon is the `hrr` sidecar
+and this package never changes that. Loopback is not the access control:
+other accounts on the machine can open `127.0.0.1`. Every memory read and
+write requires a per-install secret. The vendored daemon is the `hrr` sidecar
 over the [leCore](https://github.com/staccDOTsol/leCore) engine, cloned from
 git into `~/.local/share/openzoo-ingest/leCore`.
+
+## Who can read this memory
+
+`install.sh` writes a strong secret to `~/.config/openzoo-ingest/service-token`
+(mode `0600`) the first time it runs. The daemon creates that file itself if
+you start it without the installer. Requests that do not present the secret
+are rejected. The old public value `hrr-lab-token` is rejected even if it is
+still set in the environment. `OPENZOO_LECORE_TOKEN` / `HRR_SERVICE_TOKEN`
+override the file only when the value is at least 32 characters and is not a
+public placeholder.
+
+Request bodies are capped at 8 MiB. `HRR_MAX_BODY` may lower that or raise it
+up to 32 MiB, and no higher. Ingest keeps each bind under 400 KB.
 
 **Egress — off until you turn it on.** Two switches, both in
 `~/.config/openzoo-ingest/env`, both unset by default:
