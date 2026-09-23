@@ -1,7 +1,8 @@
 #!/bin/bash
 # Start the local leCore daemon for openzoo-ingest.
-# Bootstraps a private venv with pinned numpy, then refuses to import leCore
-# unless the worktree matches the pinned commit (every blob, not one filename).
+# Bootstraps a private venv with hash-locked numpy wheels, then refuses to
+# import leCore unless the worktree matches the pinned commit (every blob,
+# not one filename).
 # Loopback is only the bind address. The access control is the per-install
 # token at ~/.config/openzoo-ingest/service-token.
 set -euo pipefail
@@ -92,15 +93,81 @@ read_numpy_pin() {
   printf '%s\n' "${line#numpy==}"
 }
 
+# requirements.lock may list only the exact pin plus sha256 wheel hashes.
+# An sdist name, a second package, or a hash that is not 64 hex digits is
+# rejected before pip runs. pip --require-hashes then rejects every artifact
+# whose bytes are not one of those hashes; --only-binary rejects sdists even
+# if a hash were added later.
+validate_numpy_lock() {
+  local pin="$1"
+  local lock="$2"
+  local line trimmed saw_pin=0 hashes=0
+  [ -f "$lock" ] || { echo "missing numpy lock $lock" >&2; return 1; }
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%$'\r'}
+    trimmed="${line#"${line%%[![:space:]]*}"}"
+    case "$trimmed" in
+      ""|"#"*) continue ;;
+    esac
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+    if [ "${trimmed: -1}" = "\\" ]; then
+      trimmed="${trimmed%\\}"
+      trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+    fi
+    case "$trimmed" in
+      *.tar.gz*|*.tgz|*.zip*|*.egg*)
+        echo "numpy lock must not accept sdists" >&2
+        return 1
+        ;;
+    esac
+    if [ "$trimmed" = "numpy==$pin" ]; then
+      saw_pin=$((saw_pin + 1))
+      continue
+    fi
+    if [[ "$trimmed" =~ ^--hash=sha256:[0-9a-f]{64}$ ]]; then
+      hashes=$((hashes + 1))
+      continue
+    fi
+    echo "numpy lock has an unlisted requirement" >&2
+    return 1
+  done < "$lock"
+  if [ "$saw_pin" -ne 1 ] || [ "$hashes" -lt 1 ]; then
+    echo "numpy lock must pin numpy==$pin to at least one wheel hash" >&2
+    return 1
+  fi
+}
+
+_lock_sha() {
+  "$VENV/bin/python" -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$1"
+}
+
+_numpy_installed() {
+  "$VENV/bin/python" -c 'import numpy,sys; raise SystemExit(0 if numpy.__version__==sys.argv[1] else 1)' "$1" 2>/dev/null
+}
+
 install_pinned_numpy() {
-  local pin
+  local pin lock stamp digest
   pin=$(read_numpy_pin) || return 1
-  if "$VENV/bin/python" -c 'import numpy,sys; raise SystemExit(0 if numpy.__version__==sys.argv[1] else 1)' "$pin" 2>/dev/null; then
+  lock="$HERE/requirements.lock"
+  validate_numpy_lock "$pin" "$lock" || return 1
+  stamp="$VENV/numpy.lock.sha256"
+  digest=$(_lock_sha "$lock") || return 1
+  # pip treats an already-installed version as satisfied and skips hash
+  # checks. Reinstall unless this venv was already installed from this lock.
+  if _numpy_installed "$pin" && [ -f "$stamp" ] && [ "$(tr -d '[:space:]' < "$stamp")" = "$digest" ]; then
     return 0
   fi
   echo "==> installing numpy==$pin"
-  "$VENV/bin/python" -m pip install --disable-pip-version-check --only-binary=numpy "numpy==$pin"
-  "$VENV/bin/python" -c 'import numpy,sys; raise SystemExit(0 if numpy.__version__==sys.argv[1] else 1)' "$pin"
+  "$VENV/bin/python" -m pip install \
+    --disable-pip-version-check \
+    --require-hashes \
+    --only-binary=numpy \
+    --only-binary=:all: \
+    --no-deps \
+    --force-reinstall \
+    -r "$lock"
+  _numpy_installed "$pin"
+  printf '%s\n' "$digest" > "$stamp"
 }
 
 main() {

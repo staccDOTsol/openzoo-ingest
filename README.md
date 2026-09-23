@@ -22,7 +22,8 @@ ten-minute timer enabled. The [openzoo bar widget](https://github.com/staccDOTso
 is what you recall through.
 
 External dependencies: `python3` (>= 3.12) and `git` (the daemon builds a private venv
-and installs pinned `numpy` into it — nothing system-wide), `curl`, `tesseract`
+and installs hash-pinned `numpy` wheels into it — nothing system-wide; sdists and
+any artifact whose hash is not in `daemon/requirements.lock` are refused), `curl`, `tesseract`
 (ships with Omarchy; screenshot OCR). Optional: `poppler` for pdftotext —
 install it yourself if you want PDFs bound; this plugin never runs a package
 manager. The engine, [leCore](https://github.com/staccDOTsol/leCore), is
@@ -98,7 +99,10 @@ override the file only when the value is at least 32 characters and is not a
 public placeholder.
 
 Request bodies are capped at 8 MiB. `HRR_MAX_BODY` may lower that or raise it
-up to 32 MiB, and no higher. Ingest keeps each bind under 400 KB.
+up to 32 MiB, and no higher. Ingest keeps each bind under 400 KB. Replies are
+capped before they are buffered: 1 MiB from the local daemon, 64 KiB from the
+optional brain and vision endpoints. A non-success status or a body over that
+ceiling is discarded, and only the fields ingest actually uses are kept.
 
 The installer only replaces a checkout, launcher, or user unit it already owns
 (this plugin's manifest, a symlink into that checkout, or a unit carrying the

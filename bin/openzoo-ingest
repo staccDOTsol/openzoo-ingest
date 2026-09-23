@@ -61,13 +61,18 @@ import sqlite3
 import subprocess
 import sys
 import time
-import urllib.error
 import urllib.request
 from pathlib import Path
 
 _DAEMON_DIR = Path(__file__).resolve().parent.parent / "daemon"
 if str(_DAEMON_DIR) not in sys.path:
     sys.path.insert(0, str(_DAEMON_DIR))
+from bounded_response import (  # noqa: E402
+    LOCAL_MAX_BYTES,
+    REMOTE_MAX_BYTES,
+    RemoteStatus,
+    post_json,
+)
 from service_auth import AuthError, load_service_token  # noqa: E402
 
 HOME = Path.home()
@@ -100,11 +105,18 @@ _run = {"started": time.time(), "bound": 0, "chars": 0, "per_source": {}, "error
 
 # ---------------------------------------------------------------- daemon ---
 
-def post(url, body, headers, timeout):
-    req = urllib.request.Request(url, data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json", **headers})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode())
+def post(url, body, headers, timeout, *, shape, max_bytes, recall_limit=None):
+    """POST JSON and keep only `shape`.
+
+    Non-success replies are discarded unread. A Content-Length above
+    max_bytes is rejected before the body is buffered. Otherwise the body
+    is streamed to at most max_bytes+1 bytes and dropped if that extra byte
+    arrives. Fields the caller does not retain are not kept.
+    """
+    return post_json(
+        url, body, headers, timeout,
+        shape=shape, max_bytes=max_bytes, recall_limit=recall_limit,
+    )
 
 
 def service_token():
@@ -114,16 +126,23 @@ def service_token():
     return load_service_token(env_var="OPENZOO_LECORE_TOKEN", generate=False)
 
 
-def call(path, body, timeout=60):
-    return post(LECORE + path, body, {"Authorization": f"Bearer {service_token()}"}, timeout)
+def call(path, body, timeout=60, *, shape, recall_limit=None):
+    return post(
+        LECORE + path, body, {"Authorization": f"Bearer {service_token()}"}, timeout,
+        shape=shape, max_bytes=LOCAL_MAX_BYTES, recall_limit=recall_limit,
+    )
 
 
 def daemon_up():
     try:
-        call("/internal/v1/hrr/recall", {"tenant_id": TENANT, "context_id": "ctx_ping", "query": "x"}, timeout=2)
+        call(
+            "/internal/v1/hrr/recall",
+            {"tenant_id": TENANT, "context_id": "ctx_ping", "query": "x"},
+            timeout=2, shape="recall", recall_limit=1,
+        )
         return True
-    except urllib.error.HTTPError:
-        return True  # a 4xx is still a daemon answering
+    except RemoteStatus:
+        return True  # a 4xx is still a daemon answering; its body is not read
     except Exception:
         return False
 
@@ -190,7 +209,7 @@ def brain_bind(source, batch):
     if ctx:
         body["context_id"] = ctx
     try:
-        r = post(BRAIN_URL + "/v1/hrr/bind", body, headers, 180)
+        r = post(BRAIN_URL + "/v1/hrr/bind", body, headers, 180, shape="context", max_bytes=REMOTE_MAX_BYTES)
         got = r.get("context_id")
         if got and got != ctx:
             remember_context(source, got, "brain")
@@ -217,7 +236,7 @@ def bind(source, items):
         body = {"tenant_id": TENANT, "items": [{"text": i["text"], "metadata": i.get("metadata", {})} for i in batch], **CHUNK}
         if ctx:
             body["context_id"] = ctx
-        r = call("/internal/v1/hrr/bind", body, timeout=180)
+        r = call("/internal/v1/hrr/bind", body, timeout=180, shape="context")
         got = r.get("context_id")
         if not got:
             raise RuntimeError(f"bind returned no context_id: {r}")
@@ -338,7 +357,10 @@ def describe_image(path):
                                  "any names, numbers, code, errors or URLs, verbatim where short."},
         {"type": "image_url", "image_url": {"url": f"data:{mime};base64," + base64.b64encode(raw).decode()}}]}]}
     try:
-        d = post(PROXY + "/v1/chat/completions", body, {"Authorization": "Bearer sk-openzoo"}, 120)
+        d = post(
+            PROXY + "/v1/chat/completions", body, {"Authorization": "Bearer sk-openzoo"}, 120,
+            shape="vision", max_bytes=REMOTE_MAX_BYTES,
+        )
         desc = (d.get("choices") or [{}])[0].get("message", {}).get("content") or ""
         if desc.strip():
             text = (text + "\n\n" if text else "") + "[vision]\n" + desc.strip()
@@ -609,7 +631,11 @@ def recall(query, top_k=8):
     local = {k: v for k, v in contexts().items() if not k.startswith("_")}
     for source, ctx in local.items():
         try:
-            r = call("/internal/v1/hrr/recall", {"tenant_id": TENANT, "context_id": ctx, "query": query, "top_k": top_k}, timeout=15)
+            r = call(
+                "/internal/v1/hrr/recall",
+                {"tenant_id": TENANT, "context_id": ctx, "query": query, "top_k": top_k},
+                timeout=15, shape="recall", recall_limit=top_k,
+            )
         except Exception:
             continue
         for it in r.get("items", []):

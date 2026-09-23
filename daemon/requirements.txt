@@ -1,4 +1,4 @@
 # Exact pins installed by daemon/run.sh. Ranges are rejected.
-# numpy 2.5.3 requires Python >= 3.12 and publishes wheels for the
-# platforms this plugin runs on; the installer refuses sdists.
+# numpy 2.5.3 requires Python >= 3.12. Accepted wheel hashes are in
+# requirements.lock. The installer refuses sdists and any unlisted artifact.
 numpy==2.5.3

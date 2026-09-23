@@ -124,10 +124,44 @@ class PinFileTests(unittest.TestCase):
         self.assertEqual(pins, ["numpy==2.5.3"])
         script = (ROOT / "daemon" / "run.sh").read_text()
         self.assertNotIn("pip install --quiet --disable-pip-version-check numpy\n", script)
+        self.assertNotIn('pip install --disable-pip-version-check --only-binary=numpy "numpy==$pin"', script)
         self.assertIn('numpy==$pin', script)
         self.assertIn("--only-binary=numpy", script)
+        self.assertIn("--only-binary=:all:", script)
+        self.assertIn("--require-hashes", script)
+        self.assertIn("--no-deps", script)
+        self.assertIn("requirements.lock", script)
         self.assertIn("verify_engine.py", script)
         self.assertIn("ea456c3f1d4b05acc6ac1ea5a9946d77759f8d72", script)
+        lock = (ROOT / "daemon" / "requirements.lock").read_text()
+        self.assertIn("numpy==2.5.3 \\\n", lock)
+        self.assertNotIn("numpy-2.5.3.tar.gz", lock)
+        # The published sdist digest must not be an accepted artifact.
+        self.assertNotIn(
+            "df2d5874ff183595a4ba404edd04f6bd9b5505c1d7708573f6a6c17489a67563",
+            lock,
+        )
+        wheel_names = []
+        wheel_hashes = []
+        requirement_hashes = []
+        for line in lock.splitlines():
+            if line.startswith("# numpy-"):
+                name, digest = line[2:].split()
+                self.assertTrue(name.endswith(".whl"))
+                self.assertNotIn(name, wheel_names)
+                wheel_names.append(name)
+                wheel_hashes.append(digest)
+            stripped = line.strip()
+            if stripped.endswith("\\"):
+                stripped = stripped[:-1].strip()
+            if stripped.startswith("--hash=sha256:"):
+                digest = stripped[len("--hash=sha256:") :]
+                self.assertEqual(len(digest), 64)
+                self.assertEqual(digest, digest.lower())
+                requirement_hashes.append(digest)
+        self.assertGreaterEqual(len(wheel_names), 1)
+        self.assertEqual(wheel_hashes, requirement_hashes)
+        self.assertEqual(len(requirement_hashes), len(set(requirement_hashes)))
 
 
 if __name__ == "__main__":
