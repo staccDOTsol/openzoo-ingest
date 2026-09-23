@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# openzoo-ingest-owned
 """openzoo-ingest — bind what your machine produces into your own leCore memory.
 
 WHAT STAYS LOCAL AND WHAT LEAVES — explicitly:

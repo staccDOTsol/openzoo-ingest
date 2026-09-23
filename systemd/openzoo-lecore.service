@@ -1,9 +1,12 @@
+# openzoo-ingest-owned
 [Unit]
-Description=openzoo leCore memory daemon (loopback only)
+Description=openzoo leCore memory daemon (loopback, per-install token)
 After=network.target
 
 [Service]
 Type=simple
+UMask=0077
+Environment=HRR_TOKEN_FILE=%h/.config/openzoo-ingest/service-token
 ExecStart=%h/.local/share/openzoo-ingest/src/daemon/run.sh
 Restart=on-failure
 RestartSec=3

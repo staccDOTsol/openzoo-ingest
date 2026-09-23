@@ -100,6 +100,13 @@ public placeholder.
 Request bodies are capped at 8 MiB. `HRR_MAX_BODY` may lower that or raise it
 up to 32 MiB, and no higher. Ingest keeps each bind under 400 KB.
 
+The installer only replaces a checkout, launcher, or user unit it already owns
+(this plugin's manifest, a symlink into that checkout, or a unit carrying the
+`openzoo-ingest-owned` marker). An unrelated file at one of those paths stops
+the install and is left as it was. Uninstall disables and deletes only those
+owned units and the launcher. Memory under `~/.local/share/openzoo-ingest` and
+the service token stay on disk until you delete them.
+
 ## Commands
 
 ```
