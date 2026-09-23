@@ -12,9 +12,11 @@ import Quickshell.Io
 // leaves the units in place until `openzoo-ingest uninstall` — a memory is
 // not something to delete on a shell restart.
 //
-// Nothing here touches the network. install.sh in plugin mode clones the
-// leCore engine once, pinned to an exact commit, and everything after that is
-// loopback.
+// Nothing here sends clipboard, history, or transcripts off the machine.
+// install.sh in plugin mode links this checkout into place, writes a
+// mode-0600 service token, and enables the units. The daemon fetches leCore
+// at one pinned commit and checks the tree before importing it. Memory routes
+// require that token; binding to loopback is not the access control.
 Item {
   id: root
   readonly property string pluginDir: String(Qt.resolvedUrl(".")).replace(/^file:\/\//, "").replace(/\/$/, "")
